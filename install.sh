@@ -44,7 +44,7 @@ authorize() {
     [Bb]earer*)
       realm=$(printf '%s' "$challenge" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
       service=$(printf '%s' "$challenge" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
-      case "$realm" in https://*) ;; *) die "Реестр образов предложил небезопасный вход" ;; esac
+      case "$realm" in "https://$registry/"*) ;; *) die "Реестр образов предложил вход на чужом адресе" ;; esac
       curl --fail --silent --show-error --proto '=https' --max-time 60 --config "$work/basic.curl" --get --data-urlencode "service=$service" --data-urlencode "scope=repository:$repository/installer:pull" "$realm" > "$work/token.json" || die "Реестр не принял токен. Нужен классический токен GitHub с правом read:packages"
       registry_token=$(jq -er '(.token // .access_token) | select(type == "string" and test("^[A-Za-z0-9._~+/=-]+$"))' "$work/token.json") || die "Реестр не выдал доступ на чтение"
       rm -f "$work/token.json"
@@ -81,7 +81,7 @@ download() {
     layer_tar -xf "$work/layer" -C "$work/installer" --no-same-owner
     rm -f "$work/layer"
   done < "$work/layers"
-  for required in release.json SHA256SUMS install-panel.sh restore-panel.sh lib/common.sh lib/panel.sh; do
+  for required in release.json SHA256SUMS install-panel.sh restore-panel.sh update-panel.sh lib/common.sh lib/panel.sh; do
     [ -f "$work/installer/$required" ] && [ ! -L "$work/installer/$required" ] || die "В выпуске нет файла $required"
   done
   (cd "$work/installer" && sha256sum --quiet -c SHA256SUMS) || die "Файлы установщика повреждены"
@@ -94,7 +94,13 @@ main() {
   version=${VPS_PLATFORM_VERSION:-latest}
   directory=${VPS_PLATFORM_DIRECTORY:-/var/lib/vps-platform-installer}
   mode=${1:-install}
-  case "$mode" in install|restore) ;; *) die "Запуск: curl -fsSL https://raw.githubusercontent.com/hexquark/vps-platform-install/main/install.sh | sudo sh -s [install|restore]" ;; esac
+  case "$mode" in install|restore|update) ;; *) die "Запуск: curl -fsSL https://raw.githubusercontent.com/hexquark/vps-platform-install/main/install.sh | sudo sh -s [install|restore]" ;; esac
+  if [ "$mode" = update ]; then
+    [ -f "$directory/registry.json" ] || die "Нет сохранённого доступа к реестру образов"
+    registry=$(jq -er '.registry | select(type == "string")' "$directory/registry.json") || die "Повреждён сохранённый доступ к реестру"
+    repository=$(jq -er '.repository | select(type == "string")' "$directory/registry.json") || die "Повреждён сохранённый доступ к реестру"
+    printf '%s' "${VPS_PLATFORM_VERSION:-}" | grep -Eq '^v[0-9]+[.][0-9]+[.][0-9]+$' || die "Для обновления нужна точная версия выпуска"
+  fi
   [ "$(id -u)" = 0 ] || die "Запустите команду через sudo"
   [ "$(os_value ID)" = ubuntu ] || die "Нужна актуальная стабильная Ubuntu Server"
   case "$(uname -m)" in x86_64) architecture=amd64 ;; aarch64|arm64) architecture=arm64 ;; *) die "Архитектура VPS не поддерживается" ;; esac
@@ -116,9 +122,13 @@ main() {
   trap 'rm -rf "$work"' 0
   trap 'exit 1' 1 2 15
   token=${VPS_PLATFORM_TOKEN:-}
+  username=${VPS_PLATFORM_USERNAME:-}
+  if [ "$mode" = update ]; then
+    token=$(jq -er '.token | select(type == "string")' "$directory/registry.json") || die "Повреждён сохранённый доступ к реестру"
+    username=$(jq -er '.username | select(type == "string")' "$directory/registry.json") || die "Повреждён сохранённый доступ к реестру"
+  fi
   [ -n "$token" ] || token=$(hidden_input 'Классический токен GitHub с правом read:packages')
   case "$token" in ''|*[!A-Za-z0-9_]*) die "Токен должен состоять из латинских букв, цифр и подчёркивания" ;; esac
-  username=${VPS_PLATFORM_USERNAME:-}
   if [ -z "$username" ]; then
     printf 'header = "Authorization: Bearer %s"\n' "$token" > "$work/github.curl"
     curl --fail --silent --show-error --proto '=https' --max-time 60 --config "$work/github.curl" "${VPS_PLATFORM_GITHUB_API:-https://api.github.com}/user" > "$work/user.json" || die "GitHub не принял токен"
@@ -131,13 +141,17 @@ main() {
   release_directory=$directory/releases/$release_version
   [ ! -L "$directory/releases" ] || die "Каталог выпусков не должен быть ссылкой"
   mkdir -p "$directory/releases"
+  if [ "$mode" = update ] && [ "$release_version" != "$version" ]; then die "Реестр выдал выпуск $release_version вместо $version"; fi
   rm -rf "$release_directory"
   mv "$work/installer" "$release_directory"
-  jq -n --arg registry "$registry" --arg repository "$repository" --arg username "$username" --arg token "$token" '{registry:$registry,repository:$repository,username:$username,token:$token}' > "$work/registry.json"
-  mv "$work/registry.json" "$directory/registry.json"
+  if [ "$mode" != update ]; then
+    VPS_PLATFORM_SAVED_TOKEN=$token jq -n --arg registry "$registry" --arg repository "$repository" --arg username "$username" '{registry:$registry,repository:$repository,username:$username,token:env.VPS_PLATFORM_SAVED_TOKEN}' > "$work/registry.json"
+    mv "$work/registry.json" "$directory/registry.json"
+  fi
   unset token
   say "Выпуск $release_version проверен."
   set -- "$release_directory/$mode-panel.sh"
+  if [ "$mode" = update ]; then set -- "$@" --apply; fi
   if [ -n "${VPS_PLATFORM_ANSWERS:-}" ]; then set -- "$@" --answers "$VPS_PLATFORM_ANSWERS"; fi
   REGISTRY_ACCESS_FILE=$directory/registry.json sh "$@" < /dev/null
 }
